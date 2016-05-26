@@ -120,7 +120,7 @@ func newUDPTest(t *testing.T) *udpTest {
 		remotekey:  newkey(),
 		remoteaddr: &net.UDPAddr{IP: net.IP{1, 2, 3, 4}, Port: 41303},
 	}
-	test.table, test.udp = newUDP(test.localkey, test.pipe, nil, "")
+	test.table, test.udp, _ = newUDP(test.localkey, test.pipe, nil, "")
 	return test
 }
 
@@ -128,7 +128,7 @@ func newUDPTest(t *testing.T) *udpTest {
 func (test *udpTest) packetIn(wantError error, ptype byte, data packet) error {
 	enc, err := encodePacket(test.remotekey, ptype, data)
 	if err != nil {
-		return test.errorf("packet (%d) encode error: %v", err)
+		return test.errorf("packet (%d) encode error: %v", ptype, err)
 	}
 	test.sent = append(test.sent, enc)
 	if err = test.udp.handlePacket(test.remoteaddr, enc); err != wantError {
@@ -218,16 +218,17 @@ func TestUDP_responseTimeouts(t *testing.T) {
 		binary.BigEndian.PutUint64(p.from[:], uint64(i))
 		if p.ptype <= 128 {
 			p.errc = timeoutErr
+			test.udp.addpending <- p
 			nTimeouts++
 		} else {
 			p.errc = nilErr
+			test.udp.addpending <- p
 			time.AfterFunc(randomDuration(60*time.Millisecond), func() {
 				if !test.udp.handleReply(p.from, p.ptype, nil) {
 					t.Logf("not matched: %v", p)
 				}
 			})
 		}
-		test.udp.addpending <- p
 		time.Sleep(randomDuration(30 * time.Millisecond))
 	}
 
@@ -285,7 +286,7 @@ func TestUDP_findnode(t *testing.T) {
 	// put a few nodes into the table. their exact
 	// distribution shouldn't matter much, altough we need to
 	// take care not to overflow any bucket.
-	targetHash := crypto.Sha3Hash(testTarget[:])
+	targetHash := crypto.Keccak256Hash(testTarget[:])
 	nodes := &nodesByDistance{target: targetHash}
 	for i := 0; i < bucketSize; i++ {
 		nodes.push(nodeAtDistance(test.table.self.sha, i+2), bucketSize)
@@ -294,7 +295,7 @@ func TestUDP_findnode(t *testing.T) {
 
 	// ensure there's a bond with the test node,
 	// findnode won't be accepted otherwise.
-	test.table.db.updateNode(newNode(
+	test.table.db.updateNode(NewNode(
 		PubkeyID(&test.remotekey.PublicKey),
 		test.remoteaddr.IP,
 		uint16(test.remoteaddr.Port),
@@ -346,9 +347,9 @@ func TestUDP_findnodeMultiReply(t *testing.T) {
 
 	// send the reply as two packets.
 	list := []*Node{
-		MustParseNode("enode://ba85011c70bcc5c04d8607d3a0ed29aa6179c092cbdda10d5d32684fb33ed01bd94f588ca8f91ac48318087dcb02eaf36773a7a453f0eedd6742af668097b29c@10.0.1.16:41303?discport=41304"),
+		MustParseNode("enode://ba85011c70bcc5c04d8607d3a0ed29aa6179c092cbdda10d5d32684fb33ed01bd94f588ca8f91ac48318087dcb02eaf36773a7a453f0eedd6742af668097b29c@10.0.1.16:41303?discport=41301"),
 		MustParseNode("enode://81fa361d25f157cd421c60dcc28d8dac5ef6a89476633339c5df30287474520caca09627da18543d9079b5b288698b542d56167aa5c09111e55acdbbdf2ef799@10.0.1.16:41303"),
-		MustParseNode("enode://9bffefd833d53fac8e652415f4973bee289e8b1a5c6c4cbe70abf817ce8a64cee11b823b66a987f51aaa9fba0d6a91b3e6bf0d5a5d1042de8e9eeea057b217f8@10.0.1.36:41304?discport=17"),
+		MustParseNode("enode://9bffefd833d53fac8e652415f4973bee289e8b1a5c6c4cbe70abf817ce8a64cee11b823b66a987f51aaa9fba0d6a91b3e6bf0d5a5d1042de8e9eeea057b217f8@10.0.1.36:41301?discport=17"),
 		MustParseNode("enode://1b5b4aa662d7cb44a7221bfba67302590b643028197a7d5214790f3bac7aaa4a3241be9e83c09cf1f6c69d007c634faae3dc1b1221793e8446c0b3a09de65960@10.0.1.16:41303"),
 	}
 	rpclist := make([]rpcNode, len(list))

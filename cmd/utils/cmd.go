@@ -18,30 +18,24 @@
 package utils
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"regexp"
-	"strings"
 
 	"github.com/uther/go-uther/common"
 	"github.com/uther/go-uther/core"
 	"github.com/uther/go-uther/core/types"
-	"github.com/uther/go-uther/eth"
+	"github.com/uther/go-uther/internal/debug"
 	"github.com/uther/go-uther/logger"
 	"github.com/uther/go-uther/logger/glog"
+	"github.com/uther/go-uther/node"
 	"github.com/uther/go-uther/rlp"
-	"github.com/peterh/liner"
 )
 
 const (
 	importBatchSize = 2500
-)
-
-var (
-	interruptCallbacks = []func(os.Signal){}
 )
 
 func openLogFile(Datadir string, filename string) *os.File {
@@ -51,49 +45,6 @@ func openLogFile(Datadir string, filename string) *os.File {
 		panic(fmt.Sprintf("error opening log file '%s': %v", filename, err))
 	}
 	return file
-}
-
-func PromptConfirm(prompt string) (bool, error) {
-	var (
-		input string
-		err   error
-	)
-	prompt = prompt + " [y/N] "
-
-	// if liner.TerminalSupported() {
-	// 	fmt.Println("term")
-	// 	lr := liner.NewLiner()
-	// 	defer lr.Close()
-	// 	input, err = lr.Prompt(prompt)
-	// } else {
-	fmt.Print(prompt)
-	input, err = bufio.NewReader(os.Stdin).ReadString('\n')
-	fmt.Println()
-	// }
-
-	if len(input) > 0 && strings.ToUpper(input[:1]) == "Y" {
-		return true, nil
-	} else {
-		return false, nil
-	}
-
-	return false, err
-}
-
-func PromptPassword(prompt string, warnTerm bool) (string, error) {
-	if liner.TerminalSupported() {
-		lr := liner.NewLiner()
-		defer lr.Close()
-		return lr.PasswordPrompt(prompt)
-	}
-	if warnTerm {
-		fmt.Println("!! Unsupported terminal, password will be echoed.")
-	}
-	fmt.Print(prompt)
-	input, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	input = strings.TrimRight(input, "\r\n")
-	fmt.Println()
-	return input, err
 }
 
 // Fatalf formats a message to standard error and exits the program.
@@ -111,10 +62,9 @@ func Fatalf(format string, args ...interface{}) {
 	os.Exit(1)
 }
 
-func StartEthereum(ethereum *eth.Ethereum) {
-	glog.V(logger.Info).Infoln("Starting", ethereum.Name())
-	if err := ethereum.Start(); err != nil {
-		Fatalf("Error starting Ethereum: %v", err)
+func StartNode(stack *node.Node) {
+	if err := stack.Start(); err != nil {
+		Fatalf("Error starting protocol stack: %v", err)
 	}
 	go func() {
 		sigc := make(chan os.Signal, 1)
@@ -122,17 +72,15 @@ func StartEthereum(ethereum *eth.Ethereum) {
 		defer signal.Stop(sigc)
 		<-sigc
 		glog.V(logger.Info).Infoln("Got interrupt, shutting down...")
-		go ethereum.Stop()
-		logger.Flush()
+		go stack.Stop()
 		for i := 10; i > 0; i-- {
 			<-sigc
 			if i > 1 {
-				glog.V(logger.Info).Infoln("Already shutting down, please be patient.")
-				glog.V(logger.Info).Infoln("Interrupt", i-1, "more times to induce panic.")
+				glog.V(logger.Info).Infof("Already shutting down, interrupt %d more times for panic.", i-1)
 			}
 		}
-		glog.V(logger.Error).Infof("Force quitting: this might not end so well.")
-		panic("boom")
+		debug.Exit() // ensure trace and CPU profile data is flushed.
+		debug.LoudPanic("boom")
 	}()
 }
 

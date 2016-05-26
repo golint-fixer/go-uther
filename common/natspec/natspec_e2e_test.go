@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
+// +build ignore
+
 package natspec
 
 import (
@@ -34,6 +36,8 @@ import (
 	"github.com/uther/go-uther/crypto"
 	"github.com/uther/go-uther/eth"
 	"github.com/uther/go-uther/ethdb"
+	"github.com/uther/go-uther/event"
+	"github.com/uther/go-uther/node"
 	xe "github.com/uther/go-uther/xeth"
 )
 
@@ -146,13 +150,11 @@ func testEth(t *testing.T) (ethereum *eth.Ethereum, err error) {
 	}
 
 	// only use minimalistic stack with no networking
-	return eth.New(&eth.Config{
-		DataDir:                 tmp,
+	return eth.New(&node.ServiceContext{EventMux: new(event.TypeMux)}, &eth.Config{
 		AccountManager:          am,
 		Etherbase:               common.HexToAddress(testAddress),
-		MaxPeers:                0,
 		PowTest:                 true,
-		NewDB:                   func(path string) (ethdb.Database, error) { return db, nil },
+		TestGenesisState:        db,
 		GpoMinGasPrice:          common.Big1,
 		GpobaseCorrectionFactor: 1,
 		GpoMaxGasPrice:          common.Big1,
@@ -166,7 +168,7 @@ func testInit(t *testing.T) (self *testFrontend) {
 		t.Errorf("error creating ethereum: %v", err)
 		return
 	}
-	err = ethereum.Start()
+	err = ethereum.Start(nil)
 	if err != nil {
 		t.Errorf("error starting ethereum: %v", err)
 		return
@@ -174,7 +176,7 @@ func testInit(t *testing.T) (self *testFrontend) {
 
 	// mock frontend
 	self = &testFrontend{t: t, ethereum: ethereum}
-	self.xeth = xe.New(ethereum, self)
+	self.xeth = xe.New(nil, self)
 	self.wait = self.xeth.UpdateState()
 	addr, _ := self.ethereum.Etherbase()
 
@@ -236,11 +238,11 @@ func TestNatspecE2E(t *testing.T) {
 	// create a contractInfo file (mock cloud-deployed contract metadocs)
 	// incidentally this is the info for the HashReg contract itself
 	ioutil.WriteFile("/tmp/"+testFileName, []byte(testContractInfo), os.ModePerm)
-	dochash := crypto.Sha3Hash([]byte(testContractInfo))
+	dochash := crypto.Keccak256Hash([]byte(testContractInfo))
 
 	// take the codehash for the contract we wanna test
 	codeb := tf.xeth.CodeAtBytes(registrar.HashRegAddr)
-	codehash := crypto.Sha3Hash(codeb)
+	codehash := crypto.Keccak256Hash(codeb)
 
 	reg := registrar.New(tf.xeth)
 	_, err := reg.SetHashToHash(addr, codehash, dochash)

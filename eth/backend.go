@@ -19,16 +19,13 @@ package eth
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/ethereum/ethash"
@@ -36,22 +33,21 @@ import (
 	"github.com/uther/go-uther/common"
 	"github.com/uther/go-uther/common/compiler"
 	"github.com/uther/go-uther/common/httpclient"
+	"github.com/uther/go-uther/common/registrar/ethreg"
 	"github.com/uther/go-uther/core"
-	"github.com/uther/go-uther/core/state"
 	"github.com/uther/go-uther/core/types"
 	"github.com/uther/go-uther/core/vm"
-	"github.com/uther/go-uther/crypto"
 	"github.com/uther/go-uther/eth/downloader"
+	"github.com/uther/go-uther/eth/filters"
 	"github.com/uther/go-uther/ethdb"
 	"github.com/uther/go-uther/event"
 	"github.com/uther/go-uther/logger"
 	"github.com/uther/go-uther/logger/glog"
 	"github.com/uther/go-uther/miner"
+	"github.com/uther/go-uther/node"
 	"github.com/uther/go-uther/p2p"
-	"github.com/uther/go-uther/p2p/discover"
-	"github.com/uther/go-uther/p2p/nat"
 	"github.com/uther/go-uther/rlp"
-	"github.com/uther/go-uther/whisper"
+	"github.com/uther/go-uther/rpc"
 )
 
 const (
@@ -63,71 +59,33 @@ const (
 )
 
 var (
-	jsonlogger = logger.NewJsonLogger()
-
 	datadirInUseErrnos = map[uint]bool{11: true, 32: true, 35: true}
 	portInUseErrRE     = regexp.MustCompile("address already in use")
-
-	defaultBootNodes = []*discover.Node{
-		// ETH/DEV Go Bootnodes
-		discover.MustParseNode("enode://50b54003aed5ede7716831769224bc4cbd892ac92eec277e115f4c0664c553b7f0260286e9b24c3d1405f226fad0867e1837a01530bac729ffb821155fca3ccf@128.199.232.240:41303"), 		
-		discover.MustParseNode("enode://fc0cd3cd26ac6e58b7350ce1cf0d7116c0153caa758d1cebc93c5afb8c4d1b9fc1d7af7b233e5927f2ae7e365a3d1de6565224633c6e47bf3d95af167fbd2ece@158.69.195.137:41303"),	
-		discover.MustParseNode("enode://1f9ae6e8dfb9baf0980bea8bbd0eaf0a19a568e25f70843bc70eee6e8adc79e673af88392660b770e0e28c721e98e34aca81553212acdc123f42a71f15d88294@103.230.120.198:41303"),					
-	}
-
-	defaultTestNetBootNodes = []*discover.Node{
-		discover.MustParseNode("enode://1f9ae6e8dfb9baf0980bea8bbd0eaf0a19a568e25f70843bc70eee6e8adc79e673af88392660b770e0e28c721e98e34aca81553212acdc123f42a71f15d88294@103.230.120.198:41303"),
-	}
-
-	staticNodes  = "static-nodes.json"  // Path within <datadir> to search for the static node list
-	trustedNodes = "trusted-nodes.json" // Path within <datadir> to search for the trusted node list
 )
 
 type Config struct {
-	DevMode bool
-	TestNet bool
+	ChainConfig *core.ChainConfig // chain configuration
 
-	Name         string
-	NetworkId    int
-	GenesisFile  string
-	GenesisBlock *types.Block // used by block tests
-	FastSync     bool
-	Olympic      bool
+	NetworkId int    // Network ID to use for selecting peers to connect to
+	Genesis   string // Genesis JSON to seed the chain database with
+	FastSync  bool   // Enables the state download based fast synchronisation algorithm
 
 	BlockChainVersion  int
 	SkipBcVersionCheck bool // e.g. blockchain export
 	DatabaseCache      int
+	DatabaseHandles    int
 
-	DataDir   string
-	LogFile   string
-	Verbosity int
-	VmDebug   bool
 	NatSpec   bool
 	DocRoot   string
 	AutoDAG   bool
 	PowTest   bool
+	PowShared bool
 	ExtraData []byte
 
-	MaxPeers        int
-	MaxPendingPeers int
-	Discovery       bool
-	Port            string
-
-	// Space-separated list of discovery node URLs
-	BootNodes string
-
-	// This key is used to identify the node on the network.
-	// If nil, an ephemeral key is used.
-	NodeKey *ecdsa.PrivateKey
-
-	NAT  nat.Interface
-	Shh  bool
-	Dial bool
-
+	AccountManager *accounts.Manager
 	Etherbase      common.Address
 	GasPrice       *big.Int
 	MinerThreads   int
-	AccountManager *accounts.Manager
 	SolcPath       string
 
 	GpoMinGasPrice          *big.Int
@@ -137,90 +95,15 @@ type Config struct {
 	GpobaseStepUp           int
 	GpobaseCorrectionFactor int
 
-	// NewDB is used to create databases.
-	// If nil, the default is to create leveldb databases on disk.
-	NewDB func(path string) (ethdb.Database, error)
-}
+	EnableJit bool
+	ForceJit  bool
 
-func (cfg *Config) parseBootNodes() []*discover.Node {
-	if cfg.BootNodes == "" {
-		if cfg.TestNet {
-			return defaultTestNetBootNodes
-		}
-
-		return defaultBootNodes
-	}
-	var ns []*discover.Node
-	for _, url := range strings.Split(cfg.BootNodes, " ") {
-		if url == "" {
-			continue
-		}
-		n, err := discover.ParseNode(url)
-		if err != nil {
-			glog.V(logger.Error).Infof("Bootstrap URL %s: %v\n", url, err)
-			continue
-		}
-		ns = append(ns, n)
-	}
-	return ns
-}
-
-// parseNodes parses a list of discovery node URLs loaded from a .json file.
-func (cfg *Config) parseNodes(file string) []*discover.Node {
-	// Short circuit if no node config is present
-	path := filepath.Join(cfg.DataDir, file)
-	if _, err := os.Stat(path); err != nil {
-		return nil
-	}
-	// Load the nodes from the config file
-	blob, err := ioutil.ReadFile(path)
-	if err != nil {
-		glog.V(logger.Error).Infof("Failed to access nodes: %v", err)
-		return nil
-	}
-	nodelist := []string{}
-	if err := json.Unmarshal(blob, &nodelist); err != nil {
-		glog.V(logger.Error).Infof("Failed to load nodes: %v", err)
-		return nil
-	}
-	// Interpret the list as a discovery node array
-	var nodes []*discover.Node
-	for _, url := range nodelist {
-		if url == "" {
-			continue
-		}
-		node, err := discover.ParseNode(url)
-		if err != nil {
-			glog.V(logger.Error).Infof("Node URL %s: %v\n", url, err)
-			continue
-		}
-		nodes = append(nodes, node)
-	}
-	return nodes
-}
-
-func (cfg *Config) nodeKey() (*ecdsa.PrivateKey, error) {
-	// use explicit key from command line args if set
-	if cfg.NodeKey != nil {
-		return cfg.NodeKey, nil
-	}
-	// use persistent key if present
-	keyfile := filepath.Join(cfg.DataDir, "nodekey")
-	key, err := crypto.LoadECDSA(keyfile)
-	if err == nil {
-		return key, nil
-	}
-	// no persistent key, generate and store a new one
-	if key, err = crypto.GenerateKey(); err != nil {
-		return nil, fmt.Errorf("could not generate server key: %v", err)
-	}
-	if err := crypto.SaveECDSA(keyfile, key); err != nil {
-		glog.V(logger.Error).Infoln("could not persist nodekey: ", err)
-	}
-	return key, nil
+	TestGenesisBlock *types.Block   // Genesis block to seed the chain database with (testing only!)
+	TestGenesisState ethdb.Database // Genesis state to seed the database with (testing only!)
 }
 
 type Ethereum struct {
+	chainConfig *core.ChainConfig
 	// Channel for shutting down the ethereum
 	shutdownChan chan bool
 
@@ -232,11 +115,11 @@ type Ethereum struct {
 	txPool          *core.TxPool
 	blockchain      *core.BlockChain
 	accountManager  *accounts.Manager
-	whisper         *whisper.Whisper
 	pow             *ethash.Ethash
 	protocolManager *ProtocolManager
 	SolcPath        string
 	solc            *compiler.Solidity
+	gpo             *GasPriceOracle
 
 	GpoMinGasPrice          *big.Int
 	GpoMaxGasPrice          *big.Int
@@ -247,44 +130,25 @@ type Ethereum struct {
 
 	httpclient *httpclient.HTTPClient
 
-	net      *p2p.Server
 	eventMux *event.TypeMux
 	miner    *miner.Miner
-
-	// logger logger.LogSystem
 
 	Mining        bool
 	MinerThreads  int
 	NatSpec       bool
-	DataDir       string
 	AutoDAG       bool
 	PowTest       bool
 	autodagquit   chan bool
 	etherbase     common.Address
-	clientVersion string
 	netVersionId  int
-	shhVersionId  int
+	netRPCService *PublicNetAPI
 }
 
-func New(config *Config) (*Ethereum, error) {
-	logger.New(config.DataDir, config.LogFile, config.Verbosity)
-
-	// Let the database take 3/4 of the max open files (TODO figure out a way to get the actual limit of the open files)
-	const dbCount = 3
-	ethdb.OpenFileLimit = 128 / (dbCount + 1)
-
-	newdb := config.NewDB
-	if newdb == nil {
-		newdb = func(path string) (ethdb.Database, error) { return ethdb.NewLDBDatabase(path, config.DatabaseCache) }
-	}
-
+func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
 	// Open the chain database and perform any upgrades needed
-	chainDb, err := newdb(filepath.Join(config.DataDir, "chaindata"))
+	chainDb, err := ctx.OpenDatabase("chaindata", config.DatabaseCache, config.DatabaseHandles)
 	if err != nil {
-		if errno, ok := err.(syscall.Errno); ok && datadirInUseErrnos[uint(errno)] {
-			err = fmt.Errorf("%v (check if another instance of geth is already running with the same data directory '%s')", err, config.DataDir)
-		}
-		return nil, fmt.Errorf("blockchain db err: %v", err)
+		return nil, err
 	}
 	if db, ok := chainDb.(*ethdb.LDBDatabase); ok {
 		db.Meter("eth/db/chaindata/")
@@ -296,65 +160,41 @@ func New(config *Config) (*Ethereum, error) {
 		return nil, err
 	}
 
-	dappDb, err := newdb(filepath.Join(config.DataDir, "dapp"))
+	dappDb, err := ctx.OpenDatabase("dapp", config.DatabaseCache, config.DatabaseHandles)
 	if err != nil {
-		if errno, ok := err.(syscall.Errno); ok && datadirInUseErrnos[uint(errno)] {
-			err = fmt.Errorf("%v (check if another instance of geth is already running with the same data directory '%s')", err, config.DataDir)
-		}
-		return nil, fmt.Errorf("dapp db err: %v", err)
+		return nil, err
 	}
 	if db, ok := dappDb.(*ethdb.LDBDatabase); ok {
 		db.Meter("eth/db/dapp/")
 	}
-
-	nodeDb := filepath.Join(config.DataDir, "nodes")
 	glog.V(logger.Info).Infof("Protocol Versions: %v, Network Id: %v", ProtocolVersions, config.NetworkId)
 
-	if len(config.GenesisFile) > 0 {
-		fr, err := os.Open(config.GenesisFile)
+	// Load up any custom genesis block if requested
+	if len(config.Genesis) > 0 {
+		block, err := core.WriteGenesisBlock(chainDb, strings.NewReader(config.Genesis))
 		if err != nil {
 			return nil, err
 		}
-
-		block, err := core.WriteGenesisBlock(chainDb, fr)
-		if err != nil {
-			return nil, err
-		}
-		glog.V(logger.Info).Infof("Successfully wrote genesis block. New genesis hash = %x\n", block.Hash())
+		glog.V(logger.Info).Infof("Successfully wrote custom genesis block: %x", block.Hash())
 	}
 
-	// different modes
-	switch {
-	case config.Olympic:
-		glog.V(logger.Error).Infoln("Starting Olympic network")
-		fallthrough
-	case config.DevMode:
-		_, err := core.WriteOlympicGenesisBlock(chainDb, 42)
-		if err != nil {
-			return nil, err
-		}
-	case config.TestNet:
-		state.StartingNonce = 1048576 // (2**20)
-		_, err := core.WriteTestNetGenesisBlock(chainDb, 0x6d6f7264656e)
-		if err != nil {
-			return nil, err
-		}
+	// Load up a test setup if directly injected
+	if config.TestGenesisState != nil {
+		chainDb = config.TestGenesisState
 	}
-	// This is for testing only.
-	if config.GenesisBlock != nil {
-		core.WriteTd(chainDb, config.GenesisBlock.Hash(), config.GenesisBlock.Difficulty())
-		core.WriteBlock(chainDb, config.GenesisBlock)
-		core.WriteCanonicalHash(chainDb, config.GenesisBlock.Hash(), config.GenesisBlock.NumberU64())
-		core.WriteHeadBlockHash(chainDb, config.GenesisBlock.Hash())
+	if config.TestGenesisBlock != nil {
+		core.WriteTd(chainDb, config.TestGenesisBlock.Hash(), config.TestGenesisBlock.Difficulty())
+		core.WriteBlock(chainDb, config.TestGenesisBlock)
+		core.WriteCanonicalHash(chainDb, config.TestGenesisBlock.Hash(), config.TestGenesisBlock.NumberU64())
+		core.WriteHeadBlockHash(chainDb, config.TestGenesisBlock.Hash())
 	}
 
 	if !config.SkipBcVersionCheck {
-		b, _ := chainDb.Get([]byte("BlockchainVersion"))
-		bcVersion := int(common.NewValue(b).Uint())
+		bcVersion := core.GetBlockChainVersion(chainDb)
 		if bcVersion != config.BlockChainVersion && bcVersion != 0 {
 			return nil, fmt.Errorf("Blockchain DB version mismatch (%d / %d). Run geth upgradedb.\n", bcVersion, config.BlockChainVersion)
 		}
-		saveBlockchainVersion(chainDb, config.BlockChainVersion)
+		core.WriteBlockChainVersion(chainDb, config.BlockChainVersion)
 	}
 	glog.V(logger.Info).Infof("Blockchain DB Version: %d", config.BlockChainVersion)
 
@@ -362,11 +202,9 @@ func New(config *Config) (*Ethereum, error) {
 		shutdownChan:            make(chan bool),
 		chainDb:                 chainDb,
 		dappDb:                  dappDb,
-		eventMux:                &event.TypeMux{},
+		eventMux:                ctx.EventMux,
 		accountManager:          config.AccountManager,
-		DataDir:                 config.DataDir,
 		etherbase:               config.Etherbase,
-		clientVersion:           config.Name, // TODO should separate from Name
 		netVersionId:            config.NetworkId,
 		NatSpec:                 config.NatSpec,
 		MinerThreads:            config.MinerThreads,
@@ -381,74 +219,141 @@ func New(config *Config) (*Ethereum, error) {
 		GpobaseCorrectionFactor: config.GpobaseCorrectionFactor,
 		httpclient:              httpclient.New(config.DocRoot),
 	}
-
-	if config.PowTest {
+	switch {
+	case config.PowTest:
 		glog.V(logger.Info).Infof("ethash used in test mode")
 		eth.pow, err = ethash.NewForTesting()
 		if err != nil {
 			return nil, err
 		}
-	} else {
+	case config.PowShared:
+		glog.V(logger.Info).Infof("ethash used in shared mode")
+		eth.pow = ethash.NewShared()
+
+	default:
 		eth.pow = ethash.New()
 	}
-	//genesis := core.GenesisBlock(uint64(config.GenesisNonce), stateDb)
-	eth.blockchain, err = core.NewBlockChain(chainDb, eth.pow, eth.EventMux())
+
+	// load the genesis block or write a new one if no genesis
+	// block is prenent in the database.
+	genesis := core.GetBlock(chainDb, core.GetCanonicalHash(chainDb, 0))
+	if genesis == nil {
+		genesis, err = core.WriteDefaultGenesisBlock(chainDb)
+		if err != nil {
+			return nil, err
+		}
+		glog.V(logger.Info).Infoln("WARNING: Wrote default uther genesis block")
+	}
+
+	if config.ChainConfig == nil {
+		return nil, errors.New("missing chain config")
+	}
+	eth.chainConfig = config.ChainConfig
+	eth.chainConfig.VmConfig = vm.Config{
+		EnableJit: config.EnableJit,
+		ForceJit:  config.ForceJit,
+	}
+
+	eth.blockchain, err = core.NewBlockChain(chainDb, eth.chainConfig, eth.pow, eth.EventMux())
 	if err != nil {
 		if err == core.ErrNoGenesis {
-			return nil, fmt.Errorf(`Genesis block not found. Please supply a genesis block with the "--genesis /path/to/file" argument`)
+			return nil, fmt.Errorf(`No chain found. Please initialise a new chain using the "init" subcommand.`)
 		}
 		return nil, err
 	}
-	newPool := core.NewTxPool(eth.EventMux(), eth.blockchain.State, eth.blockchain.GasLimit)
+	eth.gpo = NewGasPriceOracle(eth)
+
+	newPool := core.NewTxPool(eth.chainConfig, eth.EventMux(), eth.blockchain.State, eth.blockchain.GasLimit)
 	eth.txPool = newPool
 
-	if eth.protocolManager, err = NewProtocolManager(config.FastSync, config.NetworkId, eth.eventMux, eth.txPool, eth.pow, eth.blockchain, chainDb); err != nil {
+	if eth.protocolManager, err = NewProtocolManager(eth.chainConfig, config.FastSync, config.NetworkId, eth.eventMux, eth.txPool, eth.pow, eth.blockchain, chainDb); err != nil {
 		return nil, err
 	}
-	eth.miner = miner.New(eth, eth.EventMux(), eth.pow)
+	eth.miner = miner.New(eth, eth.chainConfig, eth.EventMux(), eth.pow)
 	eth.miner.SetGasPrice(config.GasPrice)
 	eth.miner.SetExtra(config.ExtraData)
-
-	if config.Shh {
-		eth.whisper = whisper.New()
-		eth.shhVersionId = int(eth.whisper.Version())
-	}
-
-	netprv, err := config.nodeKey()
-	if err != nil {
-		return nil, err
-	}
-	protocols := append([]p2p.Protocol{}, eth.protocolManager.SubProtocols...)
-	if config.Shh {
-		protocols = append(protocols, eth.whisper.Protocol())
-	}
-	eth.net = &p2p.Server{
-		PrivateKey:      netprv,
-		Name:            config.Name,
-		MaxPeers:        config.MaxPeers,
-		MaxPendingPeers: config.MaxPendingPeers,
-		Discovery:       config.Discovery,
-		Protocols:       protocols,
-		NAT:             config.NAT,
-		NoDial:          !config.Dial,
-		BootstrapNodes:  config.parseBootNodes(),
-		StaticNodes:     config.parseNodes(staticNodes),
-		TrustedNodes:    config.parseNodes(trustedNodes),
-		NodeDatabase:    nodeDb,
-	}
-	if len(config.Port) > 0 {
-		eth.net.ListenAddr = ":" + config.Port
-	}
-
-	vm.Debug = config.VmDebug
 
 	return eth, nil
 }
 
-// Network retrieves the underlying P2P network server. This should eventually
-// be moved out into a protocol independent package, but for now use an accessor.
-func (s *Ethereum) Network() *p2p.Server {
-	return s.net
+// APIs returns the collection of RPC services the ethereum package offers.
+// NOTE, some of these services probably need to be moved to somewhere else.
+func (s *Ethereum) APIs() []rpc.API {
+	return []rpc.API{
+		{
+			Namespace: "eth",
+			Version:   "1.0",
+			Service:   NewPublicEthereumAPI(s),
+			Public:    true,
+		}, {
+			Namespace: "eth",
+			Version:   "1.0",
+			Service:   NewPublicAccountAPI(s.accountManager),
+			Public:    true,
+		}, {
+			Namespace: "personal",
+			Version:   "1.0",
+			Service:   NewPrivateAccountAPI(s.accountManager),
+			Public:    false,
+		}, {
+			Namespace: "eth",
+			Version:   "1.0",
+			Service:   NewPublicBlockChainAPI(s.chainConfig, s.blockchain, s.miner, s.chainDb, s.gpo, s.eventMux, s.accountManager),
+			Public:    true,
+		}, {
+			Namespace: "eth",
+			Version:   "1.0",
+			Service:   NewPublicTransactionPoolAPI(s),
+			Public:    true,
+		}, {
+			Namespace: "eth",
+			Version:   "1.0",
+			Service:   NewPublicMinerAPI(s),
+			Public:    true,
+		}, {
+			Namespace: "eth",
+			Version:   "1.0",
+			Service:   downloader.NewPublicDownloaderAPI(s.protocolManager.downloader, s.eventMux),
+			Public:    true,
+		}, {
+			Namespace: "miner",
+			Version:   "1.0",
+			Service:   NewPrivateMinerAPI(s),
+			Public:    false,
+		}, {
+			Namespace: "txpool",
+			Version:   "1.0",
+			Service:   NewPublicTxPoolAPI(s),
+			Public:    true,
+		}, {
+			Namespace: "eth",
+			Version:   "1.0",
+			Service:   filters.NewPublicFilterAPI(s.chainDb, s.eventMux),
+			Public:    true,
+		}, {
+			Namespace: "admin",
+			Version:   "1.0",
+			Service:   NewPrivateAdminAPI(s),
+		}, {
+			Namespace: "debug",
+			Version:   "1.0",
+			Service:   NewPublicDebugAPI(s),
+			Public:    true,
+		}, {
+			Namespace: "debug",
+			Version:   "1.0",
+			Service:   NewPrivateDebugAPI(s.chainConfig, s),
+		}, {
+			Namespace: "net",
+			Version:   "1.0",
+			Service:   s.netRPCService,
+			Public:    true,
+		}, {
+			Namespace: "admin",
+			Version:   "1.0",
+			Service:   ethreg.NewPrivateRegistarAPI(s.chainConfig, s.blockchain, s.chainDb, s.txPool, s.accountManager),
+		},
+	}
 }
 
 func (s *Ethereum) ResetWithGenesisBlock(gb *types.Block) {
@@ -458,13 +363,13 @@ func (s *Ethereum) ResetWithGenesisBlock(gb *types.Block) {
 func (s *Ethereum) Etherbase() (eb common.Address, err error) {
 	eb = s.etherbase
 	if (eb == common.Address{}) {
-		addr, e := s.AccountManager().AddressByIndex(0)
-		if e != nil {
-			err = fmt.Errorf("etherbase address must be explicitly specified")
+		firstAccount, err := s.AccountManager().AccountByIndex(0)
+		eb = firstAccount.Address
+		if err != nil {
+			return eb, fmt.Errorf("etherbase address must be explicitly specified")
 		}
-		eb = common.HexToAddress(addr)
 	}
-	return
+	return eb, nil
 }
 
 // set in js console via admin interface or wrapper from cli flags
@@ -477,86 +382,50 @@ func (s *Ethereum) StopMining()         { s.miner.Stop() }
 func (s *Ethereum) IsMining() bool      { return s.miner.Mining() }
 func (s *Ethereum) Miner() *miner.Miner { return s.miner }
 
-// func (s *Ethereum) Logger() logger.LogSystem             { return s.logger }
-func (s *Ethereum) Name() string                       { return s.net.Name }
 func (s *Ethereum) AccountManager() *accounts.Manager  { return s.accountManager }
 func (s *Ethereum) BlockChain() *core.BlockChain       { return s.blockchain }
 func (s *Ethereum) TxPool() *core.TxPool               { return s.txPool }
-func (s *Ethereum) Whisper() *whisper.Whisper          { return s.whisper }
 func (s *Ethereum) EventMux() *event.TypeMux           { return s.eventMux }
 func (s *Ethereum) ChainDb() ethdb.Database            { return s.chainDb }
 func (s *Ethereum) DappDb() ethdb.Database             { return s.dappDb }
 func (s *Ethereum) IsListening() bool                  { return true } // Always listening
-func (s *Ethereum) PeerCount() int                     { return s.net.PeerCount() }
-func (s *Ethereum) Peers() []*p2p.Peer                 { return s.net.Peers() }
-func (s *Ethereum) MaxPeers() int                      { return s.net.MaxPeers }
-func (s *Ethereum) ClientVersion() string              { return s.clientVersion }
 func (s *Ethereum) EthVersion() int                    { return int(s.protocolManager.SubProtocols[0].Version) }
 func (s *Ethereum) NetVersion() int                    { return s.netVersionId }
-func (s *Ethereum) ShhVersion() int                    { return s.shhVersionId }
 func (s *Ethereum) Downloader() *downloader.Downloader { return s.protocolManager.downloader }
 
-// Start the ethereum
-func (s *Ethereum) Start() error {
-	jsonlogger.LogJson(&logger.LogStarting{
-		ClientString:    s.net.Name,
-		ProtocolVersion: s.EthVersion(),
-	})
-	err := s.net.Start()
-	if err != nil {
-		if portInUseErrRE.MatchString(err.Error()) {
-			err = fmt.Errorf("%v (possibly another instance of geth is using the same port)", err)
-		}
-		return err
-	}
+// Protocols implements node.Service, returning all the currently configured
+// network protocols to start.
+func (s *Ethereum) Protocols() []p2p.Protocol {
+	return s.protocolManager.SubProtocols
+}
 
+// Start implements node.Service, starting all internal goroutines needed by the
+// Ethereum protocol implementation.
+func (s *Ethereum) Start(srvr *p2p.Server) error {
 	if s.AutoDAG {
 		s.StartAutoDAG()
 	}
-
 	s.protocolManager.Start()
-
-	if s.whisper != nil {
-		s.whisper.Start()
-	}
-
-	glog.V(logger.Info).Infoln("Server started")
+	s.netRPCService = NewPublicNetAPI(srvr, s.NetVersion())
 	return nil
 }
 
-func (s *Ethereum) StartForTest() {
-	jsonlogger.LogJson(&logger.LogStarting{
-		ClientString:    s.net.Name,
-		ProtocolVersion: s.EthVersion(),
-	})
-}
-
-// AddPeer connects to the given node and maintains the connection until the
-// server is shut down. If the connection fails for any reason, the server will
-// attempt to reconnect the peer.
-func (self *Ethereum) AddPeer(nodeURL string) error {
-	n, err := discover.ParseNode(nodeURL)
-	if err != nil {
-		return fmt.Errorf("invalid node URL: %v", err)
-	}
-	self.net.AddPeer(n)
-	return nil
-}
-
-func (s *Ethereum) Stop() {
-	s.net.Stop()
+// Stop implements node.Service, terminating all internal goroutines used by the
+// Ethereum protocol.
+func (s *Ethereum) Stop() error {
 	s.blockchain.Stop()
 	s.protocolManager.Stop()
 	s.txPool.Stop()
+	s.miner.Stop()
 	s.eventMux.Stop()
-	if s.whisper != nil {
-		s.whisper.Stop()
-	}
+
 	s.StopAutoDAG()
 
 	s.chainDb.Close()
 	s.dappDb.Close()
 	close(s.shutdownChan)
+
+	return nil
 }
 
 // This function will wait for a shutdown and resumes main thread execution
@@ -656,15 +525,6 @@ func dagFiles(epoch uint64) (string, string) {
 	return dag, "full-R" + dag
 }
 
-func saveBlockchainVersion(db ethdb.Database, bcVersion int) {
-	d, _ := db.Get([]byte("BlockchainVersion"))
-	blockchainVersion := common.NewValue(d).Uint()
-
-	if blockchainVersion == 0 {
-		db.Put([]byte("BlockchainVersion"), common.NewValue(bcVersion).Bytes())
-	}
-}
-
 // upgradeChainDatabase ensures that the chain database stores block split into
 // separate header and body entries.
 func upgradeChainDatabase(db ethdb.Database) error {
@@ -698,7 +558,7 @@ func upgradeChainDatabase(db ethdb.Database) error {
 			if err := core.WriteTd(db, block.Hash(), block.DeprecatedTd()); err != nil {
 				return err
 			}
-			if err := core.WriteBody(db, block.Hash(), &types.Body{block.Transactions(), block.Uncles()}); err != nil {
+			if err := core.WriteBody(db, block.Hash(), block.Body()); err != nil {
 				return err
 			}
 			if err := core.WriteHeader(db, block.Header()); err != nil {
@@ -714,7 +574,7 @@ func upgradeChainDatabase(db ethdb.Database) error {
 		if err := core.WriteTd(db, current.Hash(), current.DeprecatedTd()); err != nil {
 			return err
 		}
-		if err := core.WriteBody(db, current.Hash(), &types.Body{current.Transactions(), current.Uncles()}); err != nil {
+		if err := core.WriteBody(db, current.Hash(), current.Body()); err != nil {
 			return err
 		}
 		if err := core.WriteHeader(db, current.Header()); err != nil {
