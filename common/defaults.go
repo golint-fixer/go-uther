@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	DefaultIPCSocket = "geth.ipc"  // Default (relative) name of the IPC RPC socket
+	DefaultIPCSocket = "gethUther.ipc"  // Default (relative) name of the IPC RPC socket
 	DefaultHTTPHost  = "localhost" // Default host interface for the HTTP RPC server
 	DefaultHTTPPort  = 9323        // Default TCP port for the HTTP RPC server
 	DefaultWSHost    = "localhost" // Default host interface for the websocket RPC server
